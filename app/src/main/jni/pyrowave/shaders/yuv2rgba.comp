@@ -1,0 +1,44 @@
+#version 450
+//
+// YCbCr 4:2:0 (BT.709 limited range) -> RGBA8, on the GPU. moonlight PyroWave
+// decoder present helper (NOT part of the upstream codec). Replaces the per-pixel
+// CPU YCbCr->RGBA conversion + readback: the decoded Y/Cb/Cr plane images are
+// sampled (the linear sampler upsamples the half-res chroma) and written to an
+// offscreen RGBA image, which is then blitted to the swapchain.
+//
+// Coefficients match the previous CPU present exactly (BT.709 limited inverse), so
+// colours are unchanged.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D Y;
+layout(set = 0, binding = 1) uniform texture2D Cb;
+layout(set = 0, binding = 2) uniform texture2D Cr;
+layout(set = 0, binding = 3) uniform sampler   Samp;       // linear, clamp-to-edge
+layout(set = 0, binding = 4, rgba8) uniform writeonly image2D OutRGBA;
+
+layout(push_constant) uniform Push {
+    ivec2 size;       // output (decode) resolution
+    vec2  inv_size;   // 1.0 / size
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.size.x || p.y >= pc.size.y)
+        return;
+
+    vec2 uv = (vec2(p) + 0.5) * pc.inv_size;
+    float y  = textureLod(sampler2D(Y,  Samp), uv, 0.0).x;
+    float cb = textureLod(sampler2D(Cb, Samp), uv, 0.0).x;
+    float cr = textureLod(sampler2D(Cr, Samp), uv, 0.0).x;
+
+    // BT.709 limited-range inverse (normalised); matches the encoder's forward.
+    float yy = y  - 16.0 / 255.0;
+    float u  = cb - 128.0 / 255.0;
+    float v  = cr - 128.0 / 255.0;
+    float r = 1.1644 * yy + 1.7927 * v;
+    float g = 1.1644 * yy - 0.2132 * u - 0.5329 * v;
+    float b = 1.1644 * yy + 2.1124 * u;
+
+    imageStore(OutRGBA, p, vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0));
+}
