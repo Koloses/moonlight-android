@@ -261,15 +261,13 @@ public class PreferenceConfiguration {
         int height = getHeightFromResolutionString(resString);
         int fps = Integer.parseInt(fpsString);
 
-        // This logic is shamelessly stolen from Moonlight Qt:
+        // Resolution/FPS scaling logic adapted from Moonlight Qt:
         // https://github.com/moonlight-stream/moonlight-qt/blob/master/app/settings/streamingpreferences.cpp
 
         // Don't scale bitrate linearly beyond 60 FPS. It's definitely not a linear
         // bitrate increase for frame rate once we get to values that high.
         double frameRateFactor = (fps <= 60 ? fps : (Math.sqrt(fps / 60.f) * 60.f)) / 30.f;
 
-        // TODO: Collect some empirical data to see if these defaults make sense.
-        // We're just using the values that the Shield used, as we have for years.
         int[] pixelVals = {
             640 * 360,
             854 * 480,
@@ -316,7 +314,14 @@ public class PreferenceConfiguration {
             }
         }
 
-        return (int)Math.round(resolutionFactor * frameRateFactor) * 1000;
+        // PyroWave is an intra-only wavelet codec: every frame is a keyframe, so it
+        // needs far more bitrate than inter-frame codecs (H.264/HEVC/AV1) for
+        // comparable quality. Scale the upstream baseline so the default lands around
+        // 75 Mbps at 720p60 (vs ~10 Mbps for traditional codecs); this also yields
+        // e.g. ~150 Mbps at 1080p60, ~300 Mbps at 1440p60, and ~600 Mbps at 4K60.
+        final double PYROWAVE_BITRATE_MULTIPLIER = 7.5;
+
+        return (int)Math.round(resolutionFactor * frameRateFactor * PYROWAVE_BITRATE_MULTIPLIER) * 1000;
     }
 
     public static boolean getDefaultSmallMode(Context context) {
