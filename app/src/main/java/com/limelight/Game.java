@@ -411,6 +411,9 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
         // H.264 is always supported
         int supportedVideoFormats = MoonBridge.VIDEO_FORMAT_H264;
+        // Advertise PyroWave (native Vulkan decoder). The host only selects it if it
+        // also supports PyroWave (SCM_PYROWAVE), so this is safe with stock hosts.
+        supportedVideoFormats |= MoonBridge.VIDEO_FORMAT_PYROWAVE;
         if (decoderRenderer.isHevcSupported()) {
             supportedVideoFormats |= MoonBridge.VIDEO_FORMAT_H265;
             if (willStreamHdr && decoderRenderer.isHevcMain10Hdr10Supported()) {

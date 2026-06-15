@@ -72,6 +72,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private int videoFormat;
     private SurfaceHolder renderTarget;
     private volatile boolean stopping;
+
+    // PyroWave is decoded natively (Vulkan), bypassing MediaCodec entirely.
+    private PyroWaveDecoder pyrowaveDecoder;
+    private boolean usingPyrowave;
     private CrashListener crashListener;
     private boolean reportedCrash;
     private int consecutiveCrashCount;
@@ -707,6 +711,18 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.videoFormat = format;
         this.refreshRate = redrawRate;
 
+        if ((format & MoonBridge.VIDEO_FORMAT_MASK_PYROWAVE) != 0) {
+            // PyroWave is decoded by the native Vulkan decoder, not MediaCodec.
+            usingPyrowave = true;
+            pyrowaveDecoder = new PyroWaveDecoder();
+            if (renderTarget == null || !pyrowaveDecoder.setup(renderTarget.getSurface(), width, height)) {
+                LimeLog.severe("Unable to set up PyroWave decoder");
+                return -1;
+            }
+            LimeLog.info("Using native PyroWave decoder");
+            return 0;
+        }
+
         return initializeDecoder(false);
     }
 
@@ -1229,6 +1245,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     @Override
     public void start() {
+        if (usingPyrowave) {
+            // Native decoder renders synchronously from submitDecodeUnit; no threads.
+            return;
+        }
         startRendererThread();
         startChoreographerThread();
     }
@@ -1266,6 +1286,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     @Override
     public void stop() {
+        if (usingPyrowave) {
+            stopping = true;
+            return;
+        }
+
         // May be called already, but we'll call it now to be safe
         prepareForStop();
 
@@ -1298,6 +1323,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     @Override
     public void cleanup() {
+        if (usingPyrowave) {
+            if (pyrowaveDecoder != null) {
+                pyrowaveDecoder.cleanup();
+                pyrowaveDecoder = null;
+            }
+            return;
+        }
         videoDecoder.release();
     }
 
@@ -1430,7 +1462,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 VideoStatsFps fps = lastTwo.getFps();
                 String decoder;
 
-                if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H264) != 0) {
+                if (usingPyrowave) {
+                    decoder = "PyroWave";
+                } else if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H264) != 0) {
                     decoder = avcDecoder.getName();
                 } else if ((videoFormat & MoonBridge.VIDEO_FORMAT_MASK_H265) != 0) {
                     decoder = hevcDecoder.getName();
@@ -1465,6 +1499,37 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             lastWindowVideoStats.copy(activeWindowVideoStats);
             activeWindowVideoStats.clear();
             activeWindowVideoStats.measurementStartTimestamp = SystemClock.uptimeMillis();
+        }
+
+        if (usingPyrowave) {
+            // PyroWave decodes + presents synchronously on the native Vulkan path (no
+            // MediaCodec). Account for it in the same VideoStats the perf overlay and
+            // latency getters read, mirroring the MediaCodec accounting below, then return.
+            long pyroDecodeStart = SystemClock.uptimeMillis();
+            int ret = pyrowaveDecoder.submitDecodeUnit(decodeUnitData, decodeUnitLength);
+            long pyroDecodeTime = SystemClock.uptimeMillis() - pyroDecodeStart;
+
+            activeWindowVideoStats.decoderTimeMs += pyroDecodeTime;
+            if (!FRAME_RENDER_TIME_ONLY) {
+                activeWindowVideoStats.totalTimeMs += (enqueueTimeMs - receiveTimeMs) + pyroDecodeTime;
+            }
+
+            if (frameHostProcessingLatency != 0) {
+                if (activeWindowVideoStats.minHostProcessingLatency != 0) {
+                    activeWindowVideoStats.minHostProcessingLatency = (char) Math.min(activeWindowVideoStats.minHostProcessingLatency, frameHostProcessingLatency);
+                } else {
+                    activeWindowVideoStats.minHostProcessingLatency = frameHostProcessingLatency;
+                }
+                activeWindowVideoStats.framesWithHostProcessingLatency += 1;
+            }
+            activeWindowVideoStats.maxHostProcessingLatency = (char) Math.max(activeWindowVideoStats.maxHostProcessingLatency, frameHostProcessingLatency);
+            activeWindowVideoStats.totalHostProcessingLatency += frameHostProcessingLatency;
+
+            activeWindowVideoStats.totalFramesReceived++;
+            activeWindowVideoStats.totalFrames++;
+            activeWindowVideoStats.totalFramesRendered++;
+
+            return ret;
         }
 
         boolean csdSubmittedForThisFrame = false;

@@ -131,9 +131,60 @@ android {
     externalNativeBuild {
         ndkBuild {
             path "src/main/jni/Android.mk"
+            // Supply the Vulkan C++ headers (not bundled with the NDK) for the
+            // PyroWave codec. Pass the directory containing vulkan/vulkan.hpp via
+            // -PvulkanHeaders=/path (e.g. -PvulkanHeaders=/usr/include). If unset,
+            // the headers must be copied into jni/pyrowave/external/ (see Android.mk).
+            if (project.hasProperty('vulkanHeaders')) {
+                arguments "VULKAN_HEADERS_INCLUDE=${project.vulkanHeaders}"
+            }
         }
     }
 }
+
+// Generate the PyroWave SPIR-V shader table (consumed by jni/pyrowave/Android.mk)
+// before the native build. Requires python3 and glslangValidator on PATH (Vulkan
+// SDK). Override the interpreter/compiler with -PpyroPython= / -PpyroGlslang= .
+def pyroDir = file("src/main/jni/pyrowave")
+def pyroPython = project.hasProperty('pyroPython') ? project.pyroPython :
+        (org.gradle.internal.os.OperatingSystem.current().isWindows() ? 'python' : 'python3')
+def pyroGlslang = project.hasProperty('pyroGlslang') ? project.pyroGlslang : 'glslangValidator'
+
+tasks.register('generatePyrowaveShaders', Exec) {
+    workingDir pyroDir
+    commandLine pyroPython, 'tools/generate_shaders.py',
+            '--shader-dir', 'shaders',
+            '--output-dir', 'generated',
+            '--glslang', pyroGlslang,
+            '--target-env', 'vulkan1.1',
+            '--namespace', 'pyrowave'
+    inputs.dir file("$pyroDir/shaders")
+    outputs.file file("$pyroDir/generated/pyrowave_shaders.cpp")
+}
+
+// The NDK ships the Vulkan C headers but not the C++ bindings (vulkan.hpp /
+// vulkan_raii.hpp) the codec needs. Copy them from the system Vulkan-Headers into
+// the module's isolated external/ dir (already on the include path). Source dir
+// defaults to /usr/include (Arch vulkan-headers); override with -PvulkanHeadersSrc=.
+def pyroExternal = file("$pyroDir/external")
+def vulkanHeadersSrc = project.hasProperty('vulkanHeadersSrc') ? project.vulkanHeadersSrc : '/usr/include'
+
+tasks.register('copyVulkanHeaders', Copy) {
+    from("$vulkanHeadersSrc/vulkan") { into 'vulkan' }
+    from("$vulkanHeadersSrc/vk_video") { into 'vk_video' }
+    into pyroExternal
+    // Only run if the source headers exist and we haven't copied them already.
+    onlyIf {
+        file("$vulkanHeadersSrc/vulkan/vulkan.hpp").exists() &&
+        !file("$pyroExternal/vulkan/vulkan.hpp").exists()
+    }
+}
+
+// Run header copy + shader generation before any native (ndk-build) compilation.
+tasks.matching { it.name.startsWith('externalNativeBuild') }.configureEach {
+    dependsOn 'copyVulkanHeaders', 'generatePyrowaveShaders'
+}
+preBuild.dependsOn 'copyVulkanHeaders', 'generatePyrowaveShaders'
 
 dependencies {
     implementation 'org.bouncycastle:bcprov-jdk18on:1.77'
